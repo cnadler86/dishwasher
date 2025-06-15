@@ -1,0 +1,14 @@
+[Unit]
+Description=Dishwasher automation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=chris
+WorkingDirectory={WORKING_DIR}
+ExecStart={WORKING_DIR}/.venv/bin/python {WORKING_DIR}/App.py
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
