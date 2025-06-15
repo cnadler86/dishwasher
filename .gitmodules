@@ -1,0 +1,3 @@
+[submodule "hcpy"]
+	path = hcpy
+	url = https://github.com/cnadler86/hcpy.git
