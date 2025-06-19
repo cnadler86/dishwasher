@@ -154,6 +154,7 @@ class DishwasherController:
             program_data["options"].append({"uid": 5127, "value": VarioSpeedPlus})
 
         logger.debug(f"IntensivZone: {IntensivZone}, BrillianceDry: {BrillianceDry}, VarioSpeedPlus: {VarioSpeedPlus}")
+        logger.debug(f"Remaining time: {self.device.state.get("BSH.Common.Option.RemainingProgramTime")}")
         
         try:
             with self.device.state_lock:
