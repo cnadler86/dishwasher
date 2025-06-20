@@ -8,10 +8,12 @@ from pathlib import Path
 from time import sleep
 from typing import List, Optional, Dict, Any
 from setup_logger import setup_logging
+from awattar.client  import AwattarClient
+from dateutil import tz
 
 DEBUG = False
 DEFAULT_PROGRAM_ID = 8227
-DEFAULT_FINISH_TIME = time(2, 0)  # 2:00 AM
+DEFAULT_FINISH_TIME = time(6, 00)  # 6:00 AM
 RETRY_DELAY = 10  # seconds
 
 # Logging-Konfiguration
@@ -35,7 +37,7 @@ class DishwasherController:
         
         return config_path
 
-    def __init__(self, config_file:Path|None=None, finish_times:List[time]|None=None) -> None:
+    def __init__(self, config_file:Path|None=None, finish_times:List[time]|None=None, country:str='DE') -> None:
         # Lade die Konfiguration und sortiere die Zielzeiten
         self.finish_times = sorted(finish_times) if finish_times else None
         if not config_file:
@@ -56,6 +58,10 @@ class DishwasherController:
             self.dishwasher["key"],
             self.dishwasher.get("iv")
         )
+
+        if country.upper() not in ['DE', 'AT']:
+            raise ValueError(f"Unsupported country: {country}. Supported countries are: DE, AT.")
+        self.client = AwattarClient(country.upper())
 
         self.device = HCDevice(self.ws, self.dishwasher, debug=DEBUG)
         self.Machine = Machine(
@@ -136,7 +142,12 @@ class DishwasherController:
             "options": []  # Optionale Parameter wie Startverzögerung etc.
         }
         if not start_in:
-            start_in = self._get_time_delta()
+            best_start_time = self._get_best_start_time()
+            if best_start_time is not None:
+                delta = (best_start_time - datetime.now(tz.tzlocal())).total_seconds()
+                start_in = int(delta) if delta > 0 else None
+            else:
+                start_in = None
         if start_in:
             program_data["options"] = [{"uid": 558, "value": start_in}]
 
@@ -154,7 +165,6 @@ class DishwasherController:
             program_data["options"].append({"uid": 5127, "value": VarioSpeedPlus})
 
         logger.debug(f"IntensivZone: {IntensivZone}, BrillianceDry: {BrillianceDry}, VarioSpeedPlus: {VarioSpeedPlus}")
-        logger.debug(f"Remaining time: {self.device.state.get("BSH.Common.Option.RemainingProgramTime")}")
         
         try:
             with self.device.state_lock:
@@ -179,7 +189,27 @@ class DishwasherController:
         except Exception as e:
             logger.error(f"Fehler beim Starten: {e}")
 
+    def _get_program_duration(self) -> timedelta:
+        RemainingProgramTime = self.device.get("BSH.Common.Option.RemainingProgramTime")
+        if RemainingProgramTime:
+            return timedelta(seconds=RemainingProgramTime)
+        else:
+            return timedelta(seconds=12000)
 
+    def _get_best_start_time(self) -> datetime | None:
+        next_start_time = (self._get_next_time() - self._get_program_duration()).astimezone(tz.tzlocal())
+        now = datetime.now(tz.tzlocal())
+        if next_start_time < now:
+            return None
+        self.client.request(datetime.combine(now.date(), time(now.hour,0)), 
+                            datetime.combine(next_start_time.date(), time(next_start_time.hour+1,0)))
+        best_spot = self.client.best_slot(1)
+        if best_spot:
+            next_start_time = best_spot.start_datetime if best_spot.start_datetime < next_start_time else next_start_time
+
+        if next_start_time < now:
+            return None
+        return next_start_time
 
     def start_app(self) -> None:
         """Überwacht den Status der Spülmaschine"""
@@ -211,20 +241,19 @@ class DishwasherController:
         )
     
     #get time delta to target time, default is tomorrow 2:00 AM
-    @staticmethod
-    def _get_time_delta(target_time:datetime|None = None) -> int|None:
+    def _get_time_delta(self,target_time:datetime|None = None) -> int|None:
         """Berechnet die Zeitdifferenz bis zum Zielzeitpunkt"""
-        now = datetime.now()
-        if not target_time:
-            target_time = now.replace(hour=23, minute=59, second=59) 
-        delta = (target_time - now + timedelta(hours=1, minutes=45)).seconds
-        if delta > 60:
-            return int(min(24*60*60, delta))
+        best_start_time = self._get_best_start_time()
+        if best_start_time is not None:
+            delta = (best_start_time - datetime.now(tz.tzlocal())).total_seconds()
+            return int(delta) if delta > 0 else None
+        else:
+            return None
 
 
 #!/home/chris/HCApp/.venv/bin/python
 if __name__ == "__main__":
-    finish_times=[time(2), time(10), time(16)]
+    finish_times=[time(6), time(18,30)]
     
     while True:
         try:
