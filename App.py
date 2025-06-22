@@ -14,7 +14,7 @@ from threading import Timer
 
 DEBUG = False
 DEFAULT_PROGRAM_ID = 8227 #MaxEfficiency
-DEFAULT_AUTOSELECT_HOUR = 18  # 6 PM
+DEFAULT_AUTOSELECT_HOUR = 0  # 6 PM
 DEFAULT_FINISH_TIME = time(6, 00)  # 6:00 AM
 RETRY_DELAY = 10  # seconds
 
@@ -167,7 +167,7 @@ class DishwasherController:
         if start_in:
             program_data["options"].append({"uid": 558, "value": start_in})
 
-        logger.debug(f"Starting program {program_data['program']} with options {program_data["options"]}")
+        logger.debug(f"Starting program {program_data['program']} with options {program_data['options']}")
 
         try:
             with self.device.state_lock:
