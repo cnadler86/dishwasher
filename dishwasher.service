@@ -9,6 +9,8 @@ User=chris
 WorkingDirectory={WORKING_DIR}
 ExecStart={WORKING_DIR}/.venv/bin/python {WORKING_DIR}/App.py
 Restart=on-failure
+StartLimitIntervalSec=10
+StartLimitBurst=6
 
 [Install]
 WantedBy=multi-user.target

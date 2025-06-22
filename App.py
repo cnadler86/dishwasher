@@ -10,9 +10,11 @@ from typing import List, Optional, Dict, Any
 from setup_logger import setup_logging
 from awattar.client  import AwattarClient
 from dateutil import tz
+from threading import Timer
 
 DEBUG = False
-DEFAULT_PROGRAM_ID = 8227
+DEFAULT_PROGRAM_ID = 8227 #MaxEfficiency
+DEFAULT_AUTOSELECT_HOUR = 18  # 6 PM
 DEFAULT_FINISH_TIME = time(6, 00)  # 6:00 AM
 RETRY_DELAY = 10  # seconds
 
@@ -102,7 +104,10 @@ class DishwasherController:
     def on_enter_start(self) -> None:
         """Aktion beim Eintritt in den Start-Zustand"""
         logger.debug("Starte Spülmaschine...")
-        self.start_program()
+        self._autoselect_default_program(hour=DEFAULT_AUTOSELECT_HOUR) #Needed ni order to correctly fetch the program duration
+        t = Timer(2, self.start_program)
+        t.start()
+        # self.start_program()
 
     def on_enter_idle(self) -> None:
         """Aktion beim Eintritt in den Start-Zustand"""
@@ -134,55 +139,50 @@ class DishwasherController:
         return self.device.state.get("BSH.Common.Setting.PowerState") == 'Off' or \
                 self.device.state.get("BSH.Common.Status.OperationState") == 'Finished'
 
-    def start_program(self, program_id:int=DEFAULT_PROGRAM_ID, start_in:int|None=None) -> None:
-        """Startet das Programm zur angegebenen Zeit"""
-        # Bereite Programm-Start vor
-        program_data = {
-            "program": program_id,  # UID für Programm
-            "options": []  # Optionale Parameter wie Startverzögerung etc.
-        }
-        if not start_in:
-            best_start_time = self._get_best_start_time()
-            if best_start_time is not None:
-                delta = (best_start_time - datetime.now(tz.tzlocal())).total_seconds()
-                start_in = int(delta) if delta > 0 else None
-            else:
-                start_in = None
-        if start_in:
-            program_data["options"] = [{"uid": 558, "value": start_in}]
-
-        logger.debug(f"Starting program {program_id} with delay {start_in}")
-
+    def _get_options(self) -> List[Optional[Dict[str, Any]]]:
         IntensivZone = self.device.state.get("Dishcare.Dishwasher.Option.IntensivZone")
         BrillianceDry = self.device.state.get("Dishcare.Dishwasher.Option.BrillianceDry")
         VarioSpeedPlus = self.device.state.get("Dishcare.Dishwasher.Option.VarioSpeedPlus")
-
+        options = []
         if IntensivZone:
-            program_data["options"].append({"uid": 5126, "value": IntensivZone})
+            options.append({"uid": 5126, "value": IntensivZone})
         if BrillianceDry:
-            program_data["options"].append({"uid": 5128, "value": BrillianceDry})
+            options.append({"uid": 5128, "value": BrillianceDry})
         if VarioSpeedPlus:
-            program_data["options"].append({"uid": 5127, "value": VarioSpeedPlus})
+            options.append({"uid": 5127, "value": VarioSpeedPlus})
+        return options
 
-        logger.debug(f"IntensivZone: {IntensivZone}, BrillianceDry: {BrillianceDry}, VarioSpeedPlus: {VarioSpeedPlus}")
-        
+    def start_program(self, program_id:Optional[int]=None, start_in:int|None=None) -> None:
+        """Startet das Programm zur angegebenen Zeit"""
+        # Bereite Programm-Start vor
+        if program_id is None:
+            program_id = self.device.state.get("BSH.Common.Root.SelectedProgram")
+
+        program_data = {
+            "program": program_id if program_id else DEFAULT_PROGRAM_ID,  # UID für Programm
+            "options": self._get_options()
+        }
+        if not start_in:
+            start_in = self._get_time_delta()
+        if start_in:
+            program_data["options"].append({"uid": 558, "value": start_in})
+
+        logger.debug(f"Starting program {program_data['program']} with options {program_data["options"]}")
+
         try:
             with self.device.state_lock:
-                self.device.get("/ro/activeProgram", action="POST", data=[program_data])
+                self.device.get("/ro/activeProgram", action="POST", data=program_data)
         except Exception as e:
             logger.error(f"Failed to start program {program_id}: {e}", exc_info=True)
             raise
 
-    def select_program(self,program_id:int=DEFAULT_PROGRAM_ID, start_in:int|None=None) -> None:
+    def select_program(self,program_id:int=DEFAULT_PROGRAM_ID) -> None:
         program_data = {
             "program": program_id,  # UID für Programm
-            "options": []  # Optionale Parameter wie Startverzögerung etc.
+            "options": self._get_options()
         }
-        if not start_in:
-            start_in = self._get_time_delta(self._get_next_time())
-        if start_in:
-            program_data["options"] = [{"uid": 558, "value": start_in}]
 
+        logger.debug(f"Selecting program {program_data['program']} with options {program_data['options']}")
         try:
             with self.device.state_lock:
                 self.device.get("/ro/selectedProgram", action="POST", data=program_data)
@@ -190,7 +190,7 @@ class DishwasherController:
             logger.error(f"Fehler beim Starten: {e}")
 
     def _get_program_duration(self) -> timedelta:
-        RemainingProgramTime = self.device.get("BSH.Common.Option.RemainingProgramTime")
+        RemainingProgramTime = self.device.state.get("BSH.Common.Option.RemainingProgramTime")
         if RemainingProgramTime:
             return timedelta(seconds=RemainingProgramTime)
         else:
@@ -240,16 +240,21 @@ class DishwasherController:
             on_close=on_close
         )
     
-    #get time delta to target time, default is tomorrow 2:00 AM
-    def _get_time_delta(self,target_time:datetime|None = None) -> int|None:
+    #get time delta to target time
+    def _get_time_delta(self, start_time:datetime|None = None) -> int:
         """Berechnet die Zeitdifferenz bis zum Zielzeitpunkt"""
-        best_start_time = self._get_best_start_time()
-        if best_start_time is not None:
-            delta = (best_start_time - datetime.now(tz.tzlocal())).total_seconds()
-            return int(delta) if delta > 0 else None
+        if start_time is None:
+            start_time = self._get_best_start_time()
+        
+        if start_time is not None:
+            delta = (start_time - datetime.now(tz.tzlocal())).total_seconds()
+            return int(min(24*60*60,delta)) if delta > 0 else 0
         else:
-            return None
+            return 0
 
+    def _autoselect_default_program(self, hour:Optional[int]=None) -> None:
+        if hour is not None and (datetime.now(tz.tzlocal()).hour >= hour) and self.device.state.get("BSH.Common.Status.RemoteControlStartAllowed"):
+            self.select_program(program_id=DEFAULT_PROGRAM_ID)
 
 #!/home/chris/HCApp/.venv/bin/python
 if __name__ == "__main__":
