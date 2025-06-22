@@ -14,7 +14,7 @@ from threading import Timer
 
 DEBUG = False
 DEFAULT_PROGRAM_ID = 8227 #MaxEfficiency
-DEFAULT_AUTOSELECT_HOUR = 0  # 6 PM
+DEFAULT_AUTOSELECT_HOUR = 18  # 6 PM
 DEFAULT_FINISH_TIME = time(6, 00)  # 6:00 AM
 RETRY_DELAY = 10  # seconds
 
