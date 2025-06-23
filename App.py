@@ -1,4 +1,3 @@
-#!/home/chris/HCApp/.venv/bin/python
 import json
 from datetime import datetime, timedelta, time
 from hcpy.HCSocket import HCSocket
@@ -16,7 +15,7 @@ DEBUG = False
 DEFAULT_PROGRAM_ID = 8227 #MaxEfficiency
 DEFAULT_AUTOSELECT_HOUR = 18  # 6 PM
 DEFAULT_FINISH_TIME = time(6, 00)  # 6:00 AM
-RETRY_DELAY = 10  # seconds
+RETRY_DELAY = 60  # seconds
 
 # Logging-Konfiguration
 logger = setup_logging()
@@ -224,9 +223,9 @@ class DishwasherController:
                 except Exception as e:
                     pass
                 if self.state == "idle":
-                    self.trigger('start')
+                    self.trigger('start') #type: ignore
                 else:
-                    self.trigger('finish')
+                    self.trigger('finish') #type: ignore
                 
         def on_open(ws: HCSocket) -> None:
             logger.info("Verbindung hergestellt")
@@ -256,7 +255,6 @@ class DishwasherController:
         if hour is not None and (datetime.now(tz.tzlocal()).hour >= hour) and self.device.state.get("BSH.Common.Status.RemoteControlStartAllowed"):
             self.select_program(program_id=DEFAULT_PROGRAM_ID)
 
-#!/home/chris/HCApp/.venv/bin/python
 if __name__ == "__main__":
     finish_times=[time(6), time(18,30)]
     
@@ -265,9 +263,8 @@ if __name__ == "__main__":
             # Initialisiere Controller
             controller = DishwasherController(finish_times=finish_times)
             controller.start_app()
-            sleep(1)
+            sleep(RETRY_DELAY)
         except KeyboardInterrupt:
             break
         except Exception as e:
-            logger.error(f"Ein Fehler ist aufgetreten: {e}")
             sleep(RETRY_DELAY)

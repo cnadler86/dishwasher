@@ -1,5 +1,5 @@
 # Dishwasher Control System
-Automate best startt of a dishwasher based on the current energy prices.
+Automate best start of your BSH dishwasher based on the current energy prices.
 
 ## Installation
 ## Clone the repository
