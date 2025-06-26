@@ -11,11 +11,14 @@ from awattar.client  import AwattarClient
 from dateutil import tz
 from threading import Timer
 
+### Konfiguration
 DEBUG = False
 DEFAULT_PROGRAM_ID = 8227 #MaxEfficiency
-DEFAULT_AUTOSELECT_HOUR = 18  # 6 PM
-DEFAULT_FINISH_TIME = time(6, 00)  # 6:00 AM
-RETRY_DELAY = 60  # seconds
+DEFAULT_AUTOSELECT_HOUR = 18  # After this hour, the default program will be selected automatically
+FINISH_TIMES=[time(6), time(18,30)] # List of finish times to consider, if empty, the default time will be used
+DEFAULT_FINISH_TIME = time(6, 00)  # Normally, this is not needed and does not need to be changed, if you use the finish_times parameter
+RETRY_DELAY = 60  # Delay in seconds before retrying connection if it fails
+
 
 # Logging-Konfiguration
 logger = setup_logging()
@@ -256,12 +259,10 @@ class DishwasherController:
             self.select_program(program_id=DEFAULT_PROGRAM_ID)
 
 if __name__ == "__main__":
-    finish_times=[time(6), time(18,30)]
-    
     while True:
         try:
             # Initialisiere Controller
-            controller = DishwasherController(finish_times=finish_times)
+            controller = DishwasherController(finish_times=FINISH_TIMES)
             controller.start_app()
             sleep(RETRY_DELAY)
         except KeyboardInterrupt:
