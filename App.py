@@ -11,15 +11,15 @@ from awattar.client  import AwattarClient
 from dateutil import tz
 from threading import Timer
 
-### Konfiguration
+### Configuration
 DEBUG:bool = False
-DEFAULT_PROGRAM_ID:int = 8196 # Eco 50°. MaxEfficiency is 8227. Used only for autoselection
-DEFAULT_AUTOSELECT_HOUR:Optional[int] = 18  # After this hour, the default program will be always selected/used automatically (optional)
+DEFAULT_PROGRAM_ID:int = 8196 # Eco 50°. MaxEfficiency is 8227. Used only for auto-selection
+DEFAULT_AUTOSELECT_HOUR:Optional[int] = 18  # After this hour, the default program will always be selected/used automatically (optional)
 DEFAULT_FINISH_TIME:time = time(6, 00)  # Normally, this is not needed and does not need to be changed, if you use the FINISH_TIMES parameter
-FINISH_TIMES:Optional[List[time]] = [time(6), time(18,30)] # Optional list of finish times to consider, if empty, the default time will be used
+FINISH_TIMES:Optional[List[time]] = [time(6), time(18,30)] # Optional list of finish times to consider; if empty, the default time will be used
 RETRY_DELAY:int = 60  # Delay in seconds before retrying connection if it fails (normally not needed, but can be useful for debugging)
 
-# Logging-Konfiguration
+# Logging configuration
 logger = setup_logging()
 
 class DishwasherController:
@@ -31,7 +31,7 @@ class DishwasherController:
 
     @staticmethod
     def _get_config_path() -> Path:
-        """Returns the path to the devices config file relative to script location"""
+        """Returns the path to the devices config file relative to the script location"""
         script_dir = Path(__file__).parent
         config_path = script_dir / "hcpy" / "config" / "devices.json"
         
@@ -41,7 +41,7 @@ class DishwasherController:
         return config_path
 
     def __init__(self, config_file:Path|None=None, finish_times:List[time]|None=None, country:str='DE') -> None:
-        # Lade die Konfiguration und sortiere die Zielzeiten
+        # Load the configuration and sort the target times
         self.finish_times = sorted(finish_times) if finish_times else None
         if not config_file:
             config_file = self._get_config_path()
@@ -49,13 +49,13 @@ class DishwasherController:
         with open(config_file, 'r') as f:
             devices = json.load(f)
 
-        # Finde die Spülmaschine in den konfigurierten Geräten
+        # Find the dishwasher in the configured devices
         self.dishwasher = next(
             device for device in devices
             if "dishwasher" in device.get("name", "")
         )
 
-        # Initialisiere die Verbindung
+        # Initialize the connection
         self.ws = HCSocket(
             self.dishwasher["host"],
             self.dishwasher["key"],
@@ -89,7 +89,7 @@ class DishwasherController:
         tomorrow = today + timedelta(days=1)
 
         if not self.finish_times:
-            # If no finish times specified, use default (tomorrow 2:00 AM)
+            # If no finish times are specified, use the default (tomorrow 2:00 AM)
             return datetime.combine(tomorrow, DEFAULT_FINISH_TIME)
 
         # Check today's remaining times first
@@ -98,21 +98,21 @@ class DishwasherController:
             if target > now:
                 return target
         
-        # If no remaining times today, get the first time for tomorrow
+        # If there are no remaining times today, get the first time for tomorrow
         return datetime.combine(tomorrow, self.finish_times[0])
 
 
     def on_enter_start(self) -> None:
-        """Aktion beim Eintritt in den Start-Zustand"""
-        logger.debug("Starte Spülmaschine...")
-        self._autoselect_default_program(hour=DEFAULT_AUTOSELECT_HOUR) #Needed ni order to correctly fetch the program duration
+        """Action when entering the start state"""
+        logger.debug("Starting dishwasher...")
+        self._autoselect_default_program(hour=DEFAULT_AUTOSELECT_HOUR) # Needed in order to correctly fetch the program duration
         t = Timer(2, self.start_program)
         t.start()
         # self.start_program()
 
     def on_enter_idle(self) -> None:
-        """Aktion beim Eintritt in den Start-Zustand"""
-        logger.debug("Programm beendet...")
+        """Action when entering the idle state"""
+        logger.debug("Program finished...")
     
     def _check_conditions_start(self)-> bool:
         """
@@ -127,7 +127,7 @@ class DishwasherController:
         """
 
         with self.device.state_lock:
-            # Prüfe ob Tür geschlossen ist und der remote Start erlaubt ist und die spulmachine nicht läuft und an ist
+            # Check if the door is closed, remote start is allowed, the dishwasher is not running, and power is on
             if self.device.state.get("BSH.Common.Status.DoorState") == "Closed" and \
                self.device.state.get("BSH.Common.Status.RemoteControlStartAllowed") and \
                self.device.state.get("BSH.Common.Status.ActiveProgram") is None and \
@@ -154,13 +154,13 @@ class DishwasherController:
         return options
 
     def start_program(self, program_id:Optional[int]=None, start_in:int|None=None) -> None:
-        """Startet das Programm zur angegebenen Zeit"""
-        # Bereite Programm-Start vor
+        """Starts the program at the specified time"""
+        # Prepare program start
         if program_id is None:
             program_id = self.device.state.get("BSH.Common.Root.SelectedProgram")
 
         program_data = {
-            "program": program_id if program_id else DEFAULT_PROGRAM_ID,  # UID für Programm
+            "program": program_id if program_id else DEFAULT_PROGRAM_ID,  # UID for program
             "options": self._get_options()
         }
         if not start_in:
@@ -179,7 +179,7 @@ class DishwasherController:
 
     def select_program(self,program_id:int=DEFAULT_PROGRAM_ID) -> None:
         program_data = {
-            "program": program_id,  # UID für Programm
+            "program": program_id,  # UID for program
             "options": self._get_options()
         }
 
@@ -188,7 +188,7 @@ class DishwasherController:
             with self.device.state_lock:
                 self.device.get("/ro/selectedProgram", action="POST", data=program_data)
         except Exception as e:
-            logger.error(f"Fehler beim Starten: {e}")
+            logger.error(f"Error while starting: {e}")
 
     def _get_program_duration(self) -> timedelta:
         RemainingProgramTime = self.device.state.get("BSH.Common.Option.RemainingProgramTime")
@@ -213,7 +213,7 @@ class DishwasherController:
         return next_start_time
 
     def start_app(self) -> None:
-        """Überwacht den Status der Spülmaschine"""
+        """Monitors the status of the dishwasher"""
         def on_message(values: Dict[str, Any]) -> None:
             if values:
                 logger.debug(f"Status msg: {values}")
@@ -225,15 +225,15 @@ class DishwasherController:
                 except Exception as e:
                     pass
                 if self.state == "idle":
-                    self.trigger('start') #type: ignore
+                    self.trigger('start') # type: ignore
                 else:
-                    self.trigger('finish') #type: ignore
+                    self.trigger('finish') # type: ignore
                 
         def on_open(ws: HCSocket) -> None:
-            logger.info("Verbindung hergestellt")
+            logger.info("Connection established")
 
         def on_close(ws: HCSocket, code: int, message: str) -> None:
-            logger.info(f"Verbindung geschlossen: {message}")
+            logger.info(f"Connection closed: {message}")
 
         self.device.run_forever(
             on_message=on_message,
@@ -241,9 +241,9 @@ class DishwasherController:
             on_close=on_close
         )
     
-    #get time delta to target time
+    # Calculate time delta to target time
     def _get_time_delta(self, start_time:datetime|None = None) -> int:
-        """Berechnet die Zeitdifferenz bis zum Zielzeitpunkt"""
+        """Calculates the time difference to the target time"""
         if start_time is None:
             start_time = self._get_best_start_time()
         
@@ -260,7 +260,7 @@ class DishwasherController:
 if __name__ == "__main__":
     while True:
         try:
-            # Initialisiere Controller
+            # Initialize controller
             controller = DishwasherController(finish_times=FINISH_TIMES)
             controller.start_app()
             sleep(RETRY_DELAY)
