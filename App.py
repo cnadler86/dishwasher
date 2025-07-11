@@ -12,13 +12,12 @@ from dateutil import tz
 from threading import Timer
 
 ### Konfiguration
-DEBUG = False
-DEFAULT_PROGRAM_ID = 8227 #MaxEfficiency
-DEFAULT_AUTOSELECT_HOUR = 18  # After this hour, the default program will be selected automatically
-FINISH_TIMES=[time(6), time(18,30)] # List of finish times to consider, if empty, the default time will be used
-DEFAULT_FINISH_TIME = time(6, 00)  # Normally, this is not needed and does not need to be changed, if you use the finish_times parameter
-RETRY_DELAY = 60  # Delay in seconds before retrying connection if it fails
-
+DEBUG:bool = False
+DEFAULT_PROGRAM_ID:int = 8196 # Eco 50°. MaxEfficiency is 8227. Used only for autoselection
+DEFAULT_AUTOSELECT_HOUR:Optional[int] = 18  # After this hour, the default program will be always selected/used automatically (optional)
+DEFAULT_FINISH_TIME:time = time(6, 00)  # Normally, this is not needed and does not need to be changed, if you use the FINISH_TIMES parameter
+FINISH_TIMES:Optional[List[time]] = [time(6), time(18,30)] # Optional list of finish times to consider, if empty, the default time will be used
+RETRY_DELAY:int = 60  # Delay in seconds before retrying connection if it fails (normally not needed, but can be useful for debugging)
 
 # Logging-Konfiguration
 logger = setup_logging()
@@ -139,7 +138,7 @@ class DishwasherController:
 
     def _is_program_finish(self) -> bool:
         return self.device.state.get("BSH.Common.Setting.PowerState") == 'Off' or \
-                self.device.state.get("BSH.Common.Status.OperationState") == 'Finished'
+                self.device.state.get("BSH.Common.Status.OperationState") in ['Aborting', 'Finished']
 
     def _get_options(self) -> List[Optional[Dict[str, Any]]]:
         IntensivZone = self.device.state.get("Dishcare.Dishwasher.Option.IntensivZone")
