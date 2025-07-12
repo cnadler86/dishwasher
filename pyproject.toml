@@ -1,0 +1,26 @@
+[project]
+name = "dishwasher"
+version = "1.0.0"
+description = "Automate your BSH dishwasher to run at the best electricity price without home connect app"
+authors = [
+    { name = "Christopher Nadler" }
+]
+license = LICENSE
+readme = "README.md"
+requires-python = ">=3.8, !=3.12.*"
+dependencies = [
+    "transitions",
+    "awattar"
+]
+
+[tool.setuptools]
+packages = ["hcpy"]
+
+[project.urls]
+Homepage = "https://github.com/cnadler86/dishwasher"
+Repository = "https://github.com/cnadler86/dishwasher"
+Issues = "https://github.com/cnadler86/dishwasher/issues"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"

@@ -212,6 +212,12 @@ class DishwasherController:
             return None
         return next_start_time
 
+    def _evaluate_state(self) -> None:
+        if self.state == "idle":
+            self.trigger('start') # type: ignore
+        else:
+            self.trigger('finish') # type: ignore
+
     def start_app(self) -> None:
         """Monitors the status of the dishwasher"""
         def on_message(values: Dict[str, Any]) -> None:
@@ -224,10 +230,7 @@ class DishwasherController:
                         self.device.state.update(values)
                 except Exception as e:
                     pass
-                if self.state == "idle":
-                    self.trigger('start') # type: ignore
-                else:
-                    self.trigger('finish') # type: ignore
+                self._evaluate_state()
                 
         def on_open(ws: HCSocket) -> None:
             logger.info("Connection established")
