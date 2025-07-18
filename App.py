@@ -138,7 +138,7 @@ class DishwasherController:
 
     def _is_program_finish(self) -> bool:
         return self.device.state.get("BSH.Common.Setting.PowerState") == 'Off' or \
-                self.device.state.get("BSH.Common.Status.OperationState") in ['Aborting', 'Finished']
+                self.device.state.get("BSH.Common.Status.OperationState") in ['Aborting']
 
     def _get_options(self) -> List[Optional[Dict[str, Any]]]:
         IntensivZone = self.device.state.get("Dishcare.Dishwasher.Option.IntensivZone")
