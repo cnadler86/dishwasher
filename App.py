@@ -18,6 +18,7 @@ DEFAULT_AUTOSELECT_HOUR:Optional[int] = 18  # After this hour, the default progr
 DEFAULT_FINISH_TIME:time = time(6, 00)  # Normally, this is not needed and does not need to be changed, if you use the FINISH_TIMES parameter
 FINISH_TIMES:Optional[List[time]] = [time(6), time(18,30)] # Optional list of finish times to consider; if empty, the default time will be used
 RETRY_DELAY:int = 60  # Delay in seconds before retrying connection if it fails (normally not needed, but can be useful for debugging)
+START_TIME_OFFSET:int = 15  # Minutes to shift the start time earlier for better energy optimization (in order to catch the energy heavy load period)
 
 # Logging configuration
 logger = setup_logging()
@@ -207,7 +208,10 @@ class DishwasherController:
         best_spot = self.client.best_slot(1)
         if best_spot:
             next_start_time = best_spot.start_datetime if best_spot.start_datetime < next_start_time else next_start_time
-
+        
+        # Shift start time earlier by START_TIME_OFFSET
+        next_start_time = next_start_time - timedelta(minutes=START_TIME_OFFSET)
+        
         if next_start_time < now:
             return None
         return next_start_time
