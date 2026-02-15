@@ -77,16 +77,6 @@ fi
 PYTHON_VERSION=$($PYTHON_BIN --version)
 echo -e "${GREEN}✓${NC} Python version: $PYTHON_VERSION"
 
-# Create logs directory if it doesn't exist
-LOGS_DIR="$SCRIPT_DIR/logs"
-if [ ! -d "$LOGS_DIR" ]; then
-    mkdir -p "$LOGS_DIR"
-    chown "$REAL_USER:$USER_GROUP" "$LOGS_DIR"
-    echo -e "${GREEN}✓${NC} Created logs directory: $LOGS_DIR"
-else
-    echo -e "${GREEN}✓${NC} Logs directory exists: $LOGS_DIR"
-fi
-
 # Check if service file template exists
 if [ ! -f "$SCRIPT_DIR/$SERVICE_FILE" ]; then
     echo -e "${RED}Error: Service file template not found: $SCRIPT_DIR/$SERVICE_FILE${NC}"
@@ -101,7 +91,6 @@ echo "User:           $REAL_USER"
 echo "Group:          $USER_GROUP"
 echo "Working Dir:    $SCRIPT_DIR"
 echo "Python Binary:  $PYTHON_BIN"
-echo "Logs Dir:       $LOGS_DIR"
 echo "Service Name:   $SERVICE_NAME"
 echo ""
 
@@ -174,8 +163,6 @@ if systemctl is-active --quiet "$SERVICE_NAME"; then
     echo "  Start service:  sudo systemctl start $SERVICE_NAME"
     echo "  Restart:        sudo systemctl restart $SERVICE_NAME"
     echo "  Disable:        sudo systemctl disable $SERVICE_NAME"
-    echo ""
-    echo "Logs are also stored in: $LOGS_DIR"
     echo ""
     
     # Show last few log lines

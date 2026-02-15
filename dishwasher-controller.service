@@ -16,12 +16,14 @@ RestartSec=10
 StartLimitInterval=300
 StartLimitBurst=5
 
+# Timeout for stopping the service (10 seconds)
+TimeoutStopSec=10
+
 # Security hardening
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths={{WORKING_DIR}}/logs
 
 # Logging
 StandardOutput=journal

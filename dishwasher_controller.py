@@ -577,7 +577,22 @@ class DishwasherController:
 
     def shutdown(self) -> None:
         """Graceful shutdown"""
+        self.logger.info("Initiating graceful shutdown...")
         self._shutdown_event.set()
+        
+        # Close websocket connection to unblock run_forever()
+        if self.device and hasattr(self.device, 'ws') and self.device.ws:
+            try:
+                # Stop the WebSocketApp run_forever loop
+                if hasattr(self.device.ws, 'ws') and self.device.ws.ws:
+                    self.device.ws.ws.keep_running = False
+                    self.device.ws.ws.close()
+                    self.logger.debug("Websocket closed")
+            except Exception as e:
+                self.logger.debug(f"Error closing websocket: {e}")
+        
+        # Give a moment for cleanup
+        sleep(0.5)
 
 
 def main():
