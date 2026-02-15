@@ -1,38 +1,108 @@
+"""
+Dishwasher Controller - Optimized energy management for Home Connect dishwashers
+"""
+import logging
 import json
+import signal
+import sys
 from datetime import datetime, timedelta, time
-from hcpy.HCSocket import HCSocket
-from hcpy.HCDevice import HCDevice
-from transitions import Machine
+from enum import Enum, auto
 from pathlib import Path
 from time import sleep
 from typing import List, Optional, Dict, Any
-from setup_logger import setup_logging
-from awattar.client  import AwattarClient
+from threading import Event, Lock
+
+from hcpy.HCSocket import HCSocket
+from hcpy.HCDevice import HCDevice
+from awattar.client import AwattarClient
 from dateutil import tz
-from threading import Timer
 
-### Configuration
-DEBUG:bool = False
-DEFAULT_PROGRAM_ID:int = 8196 # Eco 50°. MaxEfficiency is 8227. Used only for auto-selection
-DEFAULT_AUTOSELECT_HOUR:Optional[int] = 18  # After this hour, the default program will always be selected/used automatically (optional)
-DEFAULT_FINISH_TIME:time = time(6, 00)  # Normally, this is not needed and does not need to be changed, if you use the FINISH_TIMES parameter
-FINISH_TIMES:Optional[List[time]] = [time(6), time(18,30)] # Optional list of finish times to consider; if empty, the default time will be used
-RETRY_DELAY:int = 60  # Delay in seconds before retrying connection if it fails (normally not needed, but can be useful for debugging)
-START_TIME_OFFSET:int = 15  # Minutes to shift the start time earlier for better energy optimization (in order to catch the energy heavy load period)
 
-# Logging configuration
-logger = setup_logging()
+# Configuration
+class Config:
+    DEBUG: bool = False
+    DEFAULT_PROGRAM_ID: int = 8196  # Eco 50°
+    DEFAULT_AUTOSELECT_HOUR: Optional[int] = 18
+    DEFAULT_FINISH_TIME: time = time(6, 0)
+    FINISH_TIMES: Optional[List[time]] = [time(6), time(18, 30)]
+    RETRY_DELAY: int = 60
+    START_TIME_OFFSET: int = 15  # Minutes
+    RECONNECT_DELAY: int = 5  # Seconds before reconnecting
+    STATE_CHECK_INTERVAL: int = 30  # Seconds between state evaluations
+
+
+class DishwasherState(Enum):
+    """Dishwasher operational states"""
+    IDLE = auto()           # Ready to start, waiting for conditions
+    SCHEDULED = auto()      # Program scheduled, waiting for start
+    RUNNING = auto()        # Program is running
+    ERROR = auto()          # Error state
+    DISCONNECTED = auto()   # Connection lost
+
+
+
+def setup_logging() -> logging.Logger:
+    logger = logging.getLogger('DishwasherApp')
+    logger.setLevel(logging.DEBUG)
+    
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    file_handler = logging.FileHandler('dishwasher.log')
+    file_handler.setFormatter(formatter)
+    file_handler.setLevel(logging.INFO)
+    
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    console_handler.setLevel(logging.DEBUG)
+    
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    return logger
+
 
 class DishwasherController:
-    state: str
-    device: HCDevice
-    ws: HCSocket
-    dishwasher: Dict[str, Any]
-    finish_times: Optional[List[time]]
+    """
+    Main controller for automated dishwasher operation with energy optimization
+    """
+    
+    def __init__(
+        self,
+        config_file: Optional[Path] = None,
+        finish_times: Optional[List[time]] = None,
+        country: str = 'DE'
+    ) -> None:
+        self.logger = setup_logging()
+        self.config = Config()
+        
+        # State management
+        self._shutdown_event = Event()
+        self._last_logged_state: Optional[DishwasherState] = None
+        
+        # Finish times configuration
+        self.finish_times = sorted(finish_times) if finish_times else None
+        
+        # Load device configuration
+        config_file = config_file or self._get_config_path()
+        self.dishwasher_config = self._load_device_config(config_file)
+        
+        # Initialize connections
+        self.ws: Optional[HCSocket] = None
+        self.device: Optional[HCDevice] = None
+        
+        # Energy optimization
+        if country.upper() not in ['DE', 'AT']:
+            raise ValueError(f"Unsupported country: {country}")
+        self.energy_client = AwattarClient(country.upper())
+        
+        # Setup signal handlers for clean shutdown
+        self._setup_signal_handlers()
+        
+        self.logger.info("DishwasherController initialized")
 
     @staticmethod
     def _get_config_path() -> Path:
-        """Returns the path to the devices config file relative to the script location"""
+        """Get path to devices config file"""
         script_dir = Path(__file__).parent
         config_path = script_dir / "hcpy" / "config" / "devices.json"
         
@@ -41,237 +111,492 @@ class DishwasherController:
         
         return config_path
 
-    def __init__(self, config_file:Path|None=None, finish_times:List[time]|None=None, country:str='DE') -> None:
-        # Load the configuration and sort the target times
-        self.finish_times = sorted(finish_times) if finish_times else None
-        if not config_file:
-            config_file = self._get_config_path()
-
+    def _load_device_config(self, config_file: Path) -> Dict[str, Any]:
+        """Load dishwasher configuration from file"""
         with open(config_file, 'r') as f:
             devices = json.load(f)
-
-        # Find the dishwasher in the configured devices
-        self.dishwasher = next(
-            device for device in devices
-            if "dishwasher" in device.get("name", "")
+        
+        dishwasher = next(
+            (device for device in devices if "dishwasher" in device.get("name", "").lower()),
+            None
         )
+        
+        if not dishwasher:
+            raise ValueError("No dishwasher found in config file")
+        
+        return dishwasher
 
-        # Initialize the connection
-        self.ws = HCSocket(
-            self.dishwasher["host"],
-            self.dishwasher["key"],
-            self.dishwasher.get("iv")
-        )
+    def _setup_signal_handlers(self) -> None:
+        """Setup handlers for graceful shutdown"""
+        def signal_handler(signum, frame):
+            self.logger.info(f"Received signal {signum}, initiating shutdown...")
+            self._shutdown_event.set()
+        
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
 
-        if country.upper() not in ['DE', 'AT']:
-            raise ValueError(f"Unsupported country: {country}. Supported countries are: DE, AT.")
-        self.client = AwattarClient(country.upper())
+    @property
+    def state(self) -> DishwasherState:
+        """Derive state from device status - no manual state management"""
+        if not self.device or not self.ws:
+            return DishwasherState.DISCONNECTED
+        
+        try:
+            with self.device.state_lock:
+                device_state = self.device.state
+                
+                # Get relevant device status fields
+                power_state = device_state.get("BSH.Common.Setting.PowerState")
+                active_program = device_state.get("BSH.Common.Root.ActiveProgram")
+                operation_state = device_state.get("BSH.Common.Status.OperationState")
+                start_in_relative = device_state.get("BSH.Common.Option.StartInRelative", 0)
+                program_progress = device_state.get("BSH.Common.Option.ProgramProgress", 0)
+                
+                # Determine state based on device status
+                # Priority order: RUNNING > SCHEDULED > IDLE
+                
+                if operation_state in ["Run", "Pause", "ActionRequired"]:
+                    # Program is actively running
+                    current_state = DishwasherState.RUNNING
+                    
+                elif active_program and operation_state == "DelayedStart":
+                    # Program scheduled with delayed start
+                    current_state = DishwasherState.SCHEDULED
+                    
+                elif active_program and start_in_relative > 0:
+                    # Program scheduled via StartInRelative
+                    current_state = DishwasherState.SCHEDULED
+                    
+                elif active_program and program_progress > 0:
+                    # Program has started (progress > 0) but might be paused
+                    current_state = DishwasherState.RUNNING
+                    
+                elif operation_state in ["Ready", "Finished", "Inactive"] and power_state == "On":
+                    # Ready for new program
+                    current_state = DishwasherState.IDLE
+                    
+                elif power_state == "On":
+                    # Power on, no active program
+                    current_state = DishwasherState.IDLE
+                    
+                else:
+                    # Power off or unknown state - treat as IDLE
+                    current_state = DishwasherState.IDLE
+                
+                # Log state transitions
+                if self._last_logged_state != current_state:
+                    if self._last_logged_state is not None:
+                        self.logger.info(
+                            f"State transition: {self._last_logged_state.name} -> {current_state.name} "
+                            f"(ActiveProgram: {active_program}, OpState: {operation_state})"
+                        )
+                    self._last_logged_state = current_state
+                
+                return current_state
+                
+        except Exception as e:
+            self.logger.error(f"Error deriving state: {e}", exc_info=True)
+            return DishwasherState.ERROR
 
-        self.device = HCDevice(self.ws, self.dishwasher, debug=DEBUG)
-        self.Machine = Machine(
-            model=self,
-            states=["idle", "start"],
-            transitions=[
-                {'trigger': 'start', 'source': 'start', 'dest': None},
-                {'trigger': 'start', 'source': 'idle', 'dest': 'start', 'conditions': '_check_conditions_start'},
-                {'trigger': 'finish', 'source': 'idle', 'dest': None},
-                {'trigger': 'finish', 'source': 'start', 'dest': 'idle', 'conditions': '_is_program_finish'}
-            ],
-            initial="idle", 
-            auto_transitions=False,
-        )
+    def _connect(self) -> bool:
+        """Establish connection to dishwasher"""
+        try:
+            self.ws = HCSocket(
+                self.dishwasher_config["host"],
+                self.dishwasher_config["key"],
+                self.dishwasher_config.get("iv")
+            )
+            
+            self.device = HCDevice(self.ws, self.dishwasher_config, debug=self.config.DEBUG)
+            self.logger.info("Connected to dishwasher")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Connection failed: {e}", exc_info=True)
+            return False
 
-    def _get_next_time(self) -> datetime:
-        '''
-        Return the next future datetime based on self.finish_times
-        '''
+    def _get_next_finish_time(self) -> datetime:
+        """Calculate next target finish time"""
         now = datetime.now()
         today = now.date()
         tomorrow = today + timedelta(days=1)
 
         if not self.finish_times:
-            # If no finish times are specified, use the default (tomorrow 2:00 AM)
-            return datetime.combine(tomorrow, DEFAULT_FINISH_TIME)
+            return datetime.combine(tomorrow, self.config.DEFAULT_FINISH_TIME)
 
-        # Check today's remaining times first
+        # Check remaining times today
         for finish_time in self.finish_times:
             target = datetime.combine(today, finish_time)
             if target > now:
                 return target
         
-        # If there are no remaining times today, get the first time for tomorrow
+        # Use first time tomorrow
         return datetime.combine(tomorrow, self.finish_times[0])
 
-
-    def on_enter_start(self) -> None:
-        """Action when entering the start state"""
-        logger.debug("Starting dishwasher...")
-        self._autoselect_default_program(hour=DEFAULT_AUTOSELECT_HOUR) # Needed in order to correctly fetch the program duration
-        t = Timer(2, self.start_program)
-        t.start()
-        # self.start_program()
-
-    def on_enter_idle(self) -> None:
-        """Action when entering the idle state"""
-        logger.debug("Program finished...")
-    
-    def _check_conditions_start(self)-> bool:
-        """
-        Check if all conditions for starting the dishwasher are met.
+    def _get_program_duration(self) -> timedelta:
+        """Get estimated program duration"""
+        if not self.device:
+            return timedelta(hours=3, minutes=20)  # Default fallback
         
-        Returns:
-            bool: True if all conditions are met:
-                - Door is closed
-                - Remote control is allowed
-                - No active program running
-                - Power is on
-        """
-
         with self.device.state_lock:
-            # Check if the door is closed, remote start is allowed, the dishwasher is not running, and power is on
-            if self.device.state.get("BSH.Common.Status.DoorState") == "Closed" and \
-               self.device.state.get("BSH.Common.Status.RemoteControlStartAllowed") and \
-               self.device.state.get("BSH.Common.Status.ActiveProgram") is None and \
-               self.device.state.get("BSH.Common.Setting.PowerState") == "On":
-                return True
-            else:
-                return False
+            remaining = self.device.state.get("BSH.Common.Option.RemainingProgramTime")
+            
+        if remaining:
+            return timedelta(seconds=remaining)
+        
+        return timedelta(hours=3, minutes=20)  # Default fallback
 
-    def _is_program_finish(self) -> bool:
-        return self.device.state.get("BSH.Common.Setting.PowerState") == 'Off' or \
-                self.device.state.get("BSH.Common.Status.OperationState") in ['Aborting']
-
-    def _get_options(self) -> List[Optional[Dict[str, Any]]]:
-        IntensivZone = self.device.state.get("Dishcare.Dishwasher.Option.IntensivZone")
-        BrillianceDry = self.device.state.get("Dishcare.Dishwasher.Option.BrillianceDry")
-        VarioSpeedPlus = self.device.state.get("Dishcare.Dishwasher.Option.VarioSpeedPlus")
-        options = []
-        if IntensivZone:
-            options.append({"uid": 5126, "value": IntensivZone})
-        if BrillianceDry:
-            options.append({"uid": 5128, "value": BrillianceDry})
-        if VarioSpeedPlus:
-            options.append({"uid": 5127, "value": VarioSpeedPlus})
-        return options
-
-    def start_program(self, program_id:Optional[int]=None, start_in:int|None=None) -> None:
-        """Starts the program at the specified time"""
-        # Prepare program start
-        if program_id is None:
-            program_id = self.device.state.get("BSH.Common.Root.SelectedProgram")
-
-        program_data = {
-            "program": program_id if program_id else DEFAULT_PROGRAM_ID,  # UID for program
-            "options": self._get_options()
-        }
-        if not start_in:
-            start_in = self._get_time_delta()
-        if start_in:
-            program_data["options"].append({"uid": 558, "value": start_in})
-
-        logger.debug(f"Starting program {program_data['program']} with options {program_data['options']}")
-
+    def _get_optimal_start_time(self) -> Optional[datetime]:
+        """Calculate optimal start time based on energy prices"""
+        finish_time = self._get_next_finish_time()
+        program_duration = self._get_program_duration()
+        
+        earliest_start = finish_time - program_duration
+        earliest_start = earliest_start.astimezone(tz.tzlocal())
+        
+        now = datetime.now(tz.tzlocal())
+        
+        # If we're already past the earliest start, return None
+        if earliest_start < now:
+            return None
+        
         try:
-            with self.device.state_lock:
-                self.device.get("/ro/activeProgram", action="POST", data=program_data)
+            # Request energy prices
+            self.energy_client.request(
+                datetime.combine(now.date(), time(now.hour, 0)),
+                datetime.combine(earliest_start.date(), time(earliest_start.hour + 1, 0))
+            )
+            
+            # Find best price slot
+            best_slot = self.energy_client.best_slot(1)
+            
+            if best_slot:
+                optimal_start = best_slot.start_datetime
+                # Don't start later than necessary
+                optimal_start = min(optimal_start, earliest_start)
+            else:
+                optimal_start = earliest_start
+            
+            # Apply offset for energy-heavy load period
+            optimal_start = optimal_start - timedelta(minutes=self.config.START_TIME_OFFSET)
+            
+            # Ensure we don't schedule in the past
+            if optimal_start < now:
+                return None
+            
+            return optimal_start
+            
         except Exception as e:
-            logger.error(f"Failed to start program {program_id}: {e}", exc_info=True)
-            raise
+            self.logger.warning(f"Energy optimization failed, using earliest start: {e}")
+            return earliest_start if earliest_start > now else None
 
-    def select_program(self,program_id:int=DEFAULT_PROGRAM_ID) -> None:
+    def _can_start_program(self) -> bool:
+        """Check if all conditions for starting are met"""
+        if not self.device:
+            return False
+        
+        with self.device.state_lock:
+            state = self.device.state
+            
+            door_closed = state.get("BSH.Common.Status.DoorState") == "Closed"
+            remote_allowed = state.get("BSH.Common.Status.RemoteControlStartAllowed")
+            no_active_program = state.get("BSH.Common.Status.ActiveProgram") is None
+            power_on = state.get("BSH.Common.Setting.PowerState") == "On"
+            
+            can_start = all([door_closed, remote_allowed, no_active_program, power_on])
+            
+            if not can_start:
+                self.logger.debug(
+                    f"Cannot start - Door: {door_closed}, Remote: {remote_allowed}, "
+                    f"NoActive: {no_active_program}, Power: {power_on}"
+                )
+            
+            return can_start
+
+    def _is_program_finished(self) -> bool:
+        """Check if program has finished or was aborted"""
+        if not self.device:
+            return False
+        
+        with self.device.state_lock:
+            state = self.device.state
+            
+            power_off = state.get("BSH.Common.Setting.PowerState") == "Off"
+            operation_state = state.get("BSH.Common.Status.OperationState")
+            active_program = state.get("BSH.Common.Root.ActiveProgram")
+            
+            # Program is finished if:
+            # - Power is off
+            # - Operation state is Finished, Aborting, or Inactive
+            # - No active program
+            finished_states = ["Finished", "Aborting", "Inactive", "Ready"]
+            is_finished = (
+                power_off or 
+                operation_state in finished_states or 
+                active_program is None
+            )
+            
+            if is_finished:
+                self.logger.debug(
+                    f"Program finished - Power: {power_off}, OpState: {operation_state}, "
+                    f"ActiveProgram: {active_program}"
+                )
+            
+            return is_finished
+
+    def _get_program_options(self) -> List[Dict[str, Any]]:
+        """Get current program options"""
+        if not self.device:
+            return []
+        
+        with self.device.state_lock:
+            state = self.device.state
+            
+            options = []
+            
+            if state.get("Dishcare.Dishwasher.Option.IntensivZone"):
+                options.append({
+                    "uid": 5126,
+                    "value": state["Dishcare.Dishwasher.Option.IntensivZone"]
+                })
+            
+            if state.get("Dishcare.Dishwasher.Option.BrillianceDry"):
+                options.append({
+                    "uid": 5128,
+                    "value": state["Dishcare.Dishwasher.Option.BrillianceDry"]
+                })
+            
+            if state.get("Dishcare.Dishwasher.Option.VarioSpeedPlus"):
+                options.append({
+                    "uid": 5127,
+                    "value": state["Dishcare.Dishwasher.Option.VarioSpeedPlus"]
+                })
+            
+            return options
+
+    def _select_program(self, program_id: Optional[int] = None) -> bool:
+        """Select a program without starting it"""
+        if not self.device:
+            return False
+        
+        if program_id is None:
+            program_id = self.config.DEFAULT_PROGRAM_ID
+        
         program_data = {
-            "program": program_id,  # UID for program
-            "options": self._get_options()
+            "program": program_id,
+            "options": self._get_program_options()
         }
-
-        logger.debug(f"Selecting program {program_data['program']} with options {program_data['options']}")
+        
         try:
             with self.device.state_lock:
                 self.device.get("/ro/selectedProgram", action="POST", data=program_data)
+            
+            self.logger.info(f"Selected program {program_id}")
+            return True
+            
         except Exception as e:
-            logger.error(f"Error while starting: {e}")
+            self.logger.error(f"Failed to select program: {e}", exc_info=True)
+            return False
 
-    def _get_program_duration(self) -> timedelta:
-        RemainingProgramTime = self.device.state.get("BSH.Common.Option.RemainingProgramTime")
-        if RemainingProgramTime:
-            return timedelta(seconds=RemainingProgramTime)
-        else:
-            return timedelta(seconds=12000)
+    def _start_program(self, start_in_seconds: Optional[int] = None) -> bool:
+        """Start the dishwasher program"""
+        if not self.device:
+            return False
+        
+        with self.device.state_lock:
+            program_id = self.device.state.get("BSH.Common.Root.SelectedProgram")
+        
+        if not program_id:
+            program_id = self.config.DEFAULT_PROGRAM_ID
+        
+        program_data = {
+            "program": program_id,
+            "options": self._get_program_options()
+        }
+        
+        # Add delayed start if specified
+        if start_in_seconds is not None and start_in_seconds > 0:
+            # Cap at 24 hours
+            start_in_seconds = min(start_in_seconds, 24 * 60 * 60)
+            program_data["options"].append({
+                "uid": 558,
+                "value": start_in_seconds
+            })
+        
+        try:
+            with self.device.state_lock:
+                self.device.get("/ro/activeProgram", action="POST", data=program_data)
+            
+            self.logger.info(
+                f"Started program {program_id}" +
+                (f" with {start_in_seconds}s delay" if start_in_seconds else "")
+            )
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to start program: {e}", exc_info=True)
+            return False
 
-    def _get_best_start_time(self) -> datetime | None:
-        next_start_time = (self._get_next_time() - self._get_program_duration()).astimezone(tz.tzlocal())
+    def _autoselect_default_program(self) -> None:
+        """Auto-select default program after configured hour"""
+        if self.config.DEFAULT_AUTOSELECT_HOUR is None:
+            return
+        
         now = datetime.now(tz.tzlocal())
-        if next_start_time < now:
-            return None
-        self.client.request(datetime.combine(now.date(), time(now.hour,0)), 
-                            datetime.combine(next_start_time.date(), time(next_start_time.hour+1,0)))
-        best_spot = self.client.best_slot(1)
-        if best_spot:
-            next_start_time = best_spot.start_datetime if best_spot.start_datetime < next_start_time else next_start_time
+        if now.hour >= self.config.DEFAULT_AUTOSELECT_HOUR:
+            if self._can_start_program():
+                self._select_program(self.config.DEFAULT_PROGRAM_ID)
+
+    def _handle_idle_state(self) -> None:
+        """Handle actions in IDLE state"""
+        if not self._can_start_program():
+            return
         
-        # Shift start time earlier by START_TIME_OFFSET
-        next_start_time = next_start_time - timedelta(minutes=START_TIME_OFFSET)
+        # Auto-select program if configured
+        self._autoselect_default_program()
         
-        if next_start_time < now:
-            return None
-        return next_start_time
+        # Check if we should start
+        optimal_start = self._get_optimal_start_time()
+        
+        if optimal_start is None:
+            self.logger.debug("No valid start time available")
+            return
+        
+        now = datetime.now(tz.tzlocal())
+        delay_seconds = int((optimal_start - now).total_seconds())
+        
+        if delay_seconds <= 0:
+            self.logger.info("Starting program immediately")
+            self._start_program()
+            # State will automatically become RUNNING via device state update
+        else:
+            self.logger.info(f"Scheduling program to start at {optimal_start}")
+            self._start_program(start_in_seconds=delay_seconds)
+            # State will automatically become SCHEDULED via device state update
+
+    def _handle_scheduled_state(self) -> None:
+        """Handle actions in SCHEDULED state"""
+        if not self.device:
+            return
+        
+        # State will automatically transition to RUNNING when operation_state changes
+        # or back to IDLE if program is cancelled/finished
+        # No explicit state setting needed - it's derived from device state
+        
+        with self.device.state_lock:
+            operation_state = self.device.state.get("BSH.Common.Status.OperationState")
+            active_program = self.device.state.get("BSH.Common.Root.ActiveProgram")
+        
+        # Just log for debugging
+        self.logger.debug(f"Scheduled - OperationState: {operation_state}, ActiveProgram: {active_program}")
+
+    def _handle_running_state(self) -> None:
+        """Handle actions in RUNNING state"""
+        # State will automatically transition to IDLE when program finishes
+        # (ActiveProgram becomes None or OperationState changes)
+        # No explicit state setting needed
+        
+        if self._is_program_finished():
+            self.logger.debug("Program finished - will transition to IDLE automatically")
 
     def _evaluate_state(self) -> None:
-        if self.state == "idle":
-            self.trigger('start') # type: ignore
-        else:
-            self.trigger('finish') # type: ignore
+        """Main state evaluation logic"""
+        current_state = self.state
+        
+        if current_state == DishwasherState.IDLE:
+            self._handle_idle_state()
+        elif current_state == DishwasherState.SCHEDULED:
+            self._handle_scheduled_state()
+        elif current_state == DishwasherState.RUNNING:
+            self._handle_running_state()
 
-    def start_app(self) -> None:
-        """Monitors the status of the dishwasher"""
-        def on_message(values: Dict[str, Any]) -> None:
-            if values:
-                logger.debug(f"Status msg: {values}")
-                if values.get("error") and values.get("resource"):
-                    return
-                try:
-                    with self.device.state_lock:
-                        self.device.state.update(values)
-                except Exception as e:
-                    pass
+    def _on_message(self, values: Dict[str, Any]) -> None:
+        """Handle incoming websocket messages"""
+        if not values:
+            return
+        
+        # Ignore error messages
+        if values.get("error") and values.get("resource"):
+            return
+        
+        self.logger.debug(f"Received: {values}")
+        
+        if self.device:
+            try:
+                with self.device.state_lock:
+                    self.device.state.update(values)
+                
+                # Evaluate state after update
                 self._evaluate_state()
                 
-        def on_open(ws: HCSocket) -> None:
-            logger.info("Connection established")
+            except Exception as e:
+                self.logger.error(f"Error processing message: {e}", exc_info=True)
 
-        def on_close(ws: HCSocket, code: int, message: str) -> None:
-            logger.info(f"Connection closed: {message}")
+    def _on_open(self, ws: HCSocket) -> None:
+        """Handle connection opened"""
+        self.logger.info("Websocket connection opened")
+        # State will be automatically derived from device state
 
-        self.device.run_forever(
-            on_message=on_message,
-            on_open=on_open,
-            on_close=on_close
-        )
-    
-    # Calculate time delta to target time
-    def _get_time_delta(self, start_time:datetime|None = None) -> int:
-        """Calculates the time difference to the target time"""
-        if start_time is None:
-            start_time = self._get_best_start_time()
+    def _on_close(self, ws: HCSocket, code: int, message: str) -> None:
+        """Handle connection closed"""
+        self.logger.warning(f"Websocket closed: {message} (code: {code})")
+        # State will automatically become DISCONNECTED since device/ws become None
+
+    def run(self) -> None:
+        """Main run loop"""
+        self.logger.info("Starting dishwasher controller")
         
-        if start_time is not None:
-            delta = (start_time - datetime.now(tz.tzlocal())).total_seconds()
-            return int(min(24*60*60,delta)) if delta > 0 else 0
-        else:
-            return 0
+        while not self._shutdown_event.is_set():
+            try:
+                # Ensure connection
+                if not self.device or self.state == DishwasherState.DISCONNECTED:
+                    if not self._connect():
+                        self.logger.error(f"Connection failed, retrying in {self.config.RECONNECT_DELAY}s")
+                        self._shutdown_event.wait(self.config.RECONNECT_DELAY)
+                        continue
+                
+                # Run websocket loop
+                if self.device:
+                    self.device.run_forever(
+                        on_message=self._on_message,
+                        on_open=self._on_open,
+                        on_close=self._on_close
+                    )
+                
+                # If we exit run_forever, we likely disconnected
+                if not self._shutdown_event.is_set():
+                    self.logger.warning(f"Disconnected, reconnecting in {self.config.RECONNECT_DELAY}s")
+                    self._shutdown_event.wait(self.config.RECONNECT_DELAY)
+                
+            except KeyboardInterrupt:
+                self.logger.info("Keyboard interrupt received")
+                break
+            except Exception as e:
+                self.logger.error(f"Unexpected error: {e}", exc_info=True)
+                self._shutdown_event.wait(self.config.RETRY_DELAY)
+        
+        self.logger.info("Shutting down dishwasher controller")
 
-    def _autoselect_default_program(self, hour:Optional[int]=None) -> None:
-        if hour is not None and (datetime.now(tz.tzlocal()).hour >= hour) and self.device.state.get("BSH.Common.Status.RemoteControlStartAllowed"):
-            self.select_program(program_id=DEFAULT_PROGRAM_ID)
+    def shutdown(self) -> None:
+        """Graceful shutdown"""
+        self._shutdown_event.set()
+
+
+def main():
+    """Main entry point"""
+    controller = DishwasherController(
+        finish_times=Config.FINISH_TIMES,
+        country='DE'
+    )
+    
+    try:
+        controller.run()
+    except Exception as e:
+        controller.logger.error(f"Fatal error: {e}", exc_info=True)
+        sys.exit(1)
+    finally:
+        controller.shutdown()
+
 
 if __name__ == "__main__":
-    while True:
-        try:
-            # Initialize controller
-            controller = DishwasherController(finish_times=FINISH_TIMES)
-            controller.start_app()
-            sleep(RETRY_DELAY)
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            sleep(RETRY_DELAY)
+    main()
