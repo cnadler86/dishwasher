@@ -37,12 +37,6 @@ Adapt the default values in `App.py` in the `Config` class to your needs. The mo
 ## Install systemd service
 
 ```bash
-chmod +x App.py
-```
-
-## 2. Service installieren (ein Befehl!)
-
-```bash
 sudo ./install.sh
 ```
 

@@ -335,7 +335,7 @@ class DishwasherController:
             )
             
             if is_finished:
-                self.logger.debug(
+                self.logger.info(
                     f"Program finished - Power: {power_off}, OpState: {operation_state}, "
                     f"ActiveProgram: {active_program}"
                 )
@@ -457,7 +457,7 @@ class DishwasherController:
         optimal_start = self._get_optimal_start_time()
         
         if optimal_start is None:
-            self.logger.debug("No valid start time available")
+            self.logger.error("No valid start time available")
             return
         
         now = datetime.now(tz.tzlocal())
