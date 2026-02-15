@@ -17,7 +17,7 @@ StartLimitInterval=300
 StartLimitBurst=5
 
 # Timeout for stopping the service (10 seconds)
-TimeoutStopSec=10
+TimeoutStopSec=5
 
 # Security hardening
 NoNewPrivileges=true
