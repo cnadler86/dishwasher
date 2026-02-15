@@ -47,8 +47,8 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PYTHON_BIN=""
 
 # Check for venv in common locations
-if [ -f "$SCRIPT_DIR/venv/bin/python3" ]; then
-    PYTHON_BIN="$SCRIPT_DIR/venv/bin/python3"
+if [ -f "$SCRIPT_DIR/.venv/bin/python3" ]; then
+    PYTHON_BIN="$SCRIPT_DIR/.venv/bin/python3"
     echo -e "${GREEN}✓${NC} Found Python in venv: $PYTHON_BIN"
 elif [ -f "$SCRIPT_DIR/../venv/bin/python3" ]; then
     PYTHON_BIN="$SCRIPT_DIR/../venv/bin/python3"
