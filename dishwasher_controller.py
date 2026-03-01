@@ -280,7 +280,7 @@ class DishwasherController:
             
             # Ensure we don't schedule in the past
             if optimal_start < now:
-                return None
+                optimal_start = now
             
             return optimal_start
             
