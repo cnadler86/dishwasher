@@ -3,6 +3,7 @@ Dishwasher Controller - Optimized energy management for Home Connect dishwashers
 """
 import logging
 import json
+import csv
 import signal
 import sys
 from datetime import datetime, timedelta, time
@@ -16,6 +17,7 @@ from hcpy.HCSocket import HCSocket
 from hcpy.HCDevice import HCDevice
 from awattar.client import AwattarClient
 from dateutil import tz
+import paho.mqtt.client as mqtt
 
 
 # Configuration
@@ -29,6 +31,17 @@ class Config:
     START_TIME_OFFSET: int = 15  # Minutes
     RECONNECT_DELAY: int = 5  # Seconds before reconnecting
     STATE_CHECK_INTERVAL: int = 30  # Seconds between state evaluations
+    LOAD_PROFILE_DIR: Path = Path(__file__).parent / "load_profiles"
+    LOAD_PROFILE_FILE_TEMPLATE: str = "{program_id}.csv"
+    MQTT_ENABLED: bool = True
+    MQTT_HOST: str = "localhost"
+    MQTT_PORT: int = 1883
+    MQTT_USERNAME: Optional[str] = None
+    MQTT_PASSWORD: Optional[str] = None
+    MQTT_TOPIC_PREFIX: str = "gridpythia/appliance_load/forecast"
+    MQTT_QOS: int = 1
+    MQTT_RETAIN: bool = True
+    MQTT_CLIENT_ID: str = "dishwasher"
 
 
 class DishwasherState(Enum):
@@ -76,6 +89,7 @@ class DishwasherController:
         # State management
         self._shutdown_event = Event()
         self._last_logged_state: Optional[DishwasherState] = None
+        self._awaiting_post_run_reset: bool = False
         
         # Finish times configuration
         self.finish_times = sorted(finish_times) if finish_times else None
@@ -87,6 +101,9 @@ class DishwasherController:
         # Initialize connections
         self.ws: Optional[HCSocket] = None
         self.device: Optional[HCDevice] = None
+        self._mqtt_client: Optional[mqtt.Client] = None
+        self._mqtt_lock = Lock()
+        self._current_forecast: List[Dict[str, Any]] = []
         
         # Energy optimization
         if country.upper() not in ['DE', 'AT']:
@@ -149,6 +166,7 @@ class DishwasherController:
                 operation_state = device_state.get("BSH.Common.Status.OperationState")
                 start_in_relative = device_state.get("BSH.Common.Option.StartInRelative", 0)
                 program_progress = device_state.get("BSH.Common.Option.ProgramProgress", 0)
+                door_state = device_state.get("BSH.Common.Status.DoorState")
                 
                 # Determine state based on device status
                 # Priority order: RUNNING > SCHEDULED > IDLE
@@ -156,6 +174,7 @@ class DishwasherController:
                 if operation_state in ["Run", "Pause", "ActionRequired"]:
                     # Program is actively running
                     current_state = DishwasherState.RUNNING
+                    self._awaiting_post_run_reset = True
                     
                 elif active_program and operation_state == "DelayedStart":
                     # Program scheduled with delayed start
@@ -168,6 +187,19 @@ class DishwasherController:
                 elif active_program and program_progress > 0:
                     # Program has started (progress > 0) but might be paused
                     current_state = DishwasherState.RUNNING
+                    self._awaiting_post_run_reset = True
+
+                elif self._awaiting_post_run_reset:
+                    # Some devices leave the remote-start flag active after completion.
+                    # Stay in RUNNING until user interaction (door open) or power-off occurs.
+                    if power_state == "Off" or door_state == "Open":
+                        current_state = DishwasherState.IDLE
+                        self._awaiting_post_run_reset = False
+                        self.logger.info(
+                            "Post-run reset detected (door opened or power off). Returning to IDLE."
+                        )
+                    else:
+                        current_state = DishwasherState.RUNNING
                     
                 elif operation_state in ["Ready", "Finished", "Inactive"] and power_state == "On":
                     # Ready for new program
@@ -372,6 +404,172 @@ class DishwasherController:
             
             return options
 
+    def _get_selected_or_default_program_id(self) -> int:
+        """Determine currently selected program, fallback to configured default."""
+        if not self.device:
+            return self.config.DEFAULT_PROGRAM_ID
+
+        with self.device.state_lock:
+            selected = self.device.state.get("BSH.Common.Root.SelectedProgram")
+
+        if selected:
+            return selected
+
+        return self.config.DEFAULT_PROGRAM_ID
+
+    def _get_load_profile_path(self, program_id: int) -> Path:
+        """Build profile path from program number and configured file naming."""
+        filename = self.config.LOAD_PROFILE_FILE_TEMPLATE.format(program_id=program_id)
+        return self.config.LOAD_PROFILE_DIR / filename
+
+    def _load_profile_rows(self, program_id: int) -> List[Dict[str, Any]]:
+        """Load CSV profile rows with time offset and energy demand."""
+        profile_path = self._get_load_profile_path(program_id)
+
+        if not profile_path.exists():
+            self.logger.warning(f"No load profile found for program {program_id}: {profile_path}")
+            return []
+
+        rows: List[Dict[str, Any]] = []
+        with open(profile_path, "r", encoding="utf-8") as csv_file:
+            reader = csv.DictReader(csv_file, delimiter=";")
+            for row in reader:
+                time_raw = (row.get("Time") or "").strip()
+                energy_raw = (row.get("Energy_wh") or "").strip()
+                if not time_raw or not energy_raw:
+                    continue
+
+                try:
+                    hours_str, minutes_str = time_raw.split(":")
+                    offset = timedelta(hours=int(hours_str), minutes=int(minutes_str))
+                    energy_wh = float(energy_raw.replace(",", "."))
+                except Exception:
+                    self.logger.warning(
+                        f"Skipping invalid load profile row in {profile_path}: {row}"
+                    )
+                    continue
+
+                rows.append({"offset": offset, "energy_wh": energy_wh})
+
+        return rows
+
+    def _ensure_mqtt_connection(self) -> bool:
+        """Initialize and connect MQTT client when enabled."""
+        if not self.config.MQTT_ENABLED:
+            return False
+
+        with self._mqtt_lock:
+            if self._mqtt_client is not None:
+                return True
+
+            try:
+                client = mqtt.Client(client_id=self.config.MQTT_CLIENT_ID)
+                if self.config.MQTT_USERNAME:
+                    client.username_pw_set(self.config.MQTT_USERNAME, self.config.MQTT_PASSWORD)
+
+                client.connect(self.config.MQTT_HOST, self.config.MQTT_PORT, keepalive=60)
+                client.loop_start()
+                self._mqtt_client = client
+                self.logger.info(
+                    f"Connected MQTT client to {self.config.MQTT_HOST}:{self.config.MQTT_PORT}"
+                )
+                return True
+            except Exception as e:
+                self.logger.error(f"Failed to connect MQTT client: {e}", exc_info=True)
+                self._mqtt_client = None
+                return False
+
+    def _clear_retained_topic(self, topic: str) -> None:
+        """Delete a retained MQTT message by publishing empty payload with retain flag."""
+        if not self._mqtt_client:
+            return
+
+        info = self._mqtt_client.publish(
+            topic,
+            payload="",
+            qos=self.config.MQTT_QOS,
+            retain=self.config.MQTT_RETAIN,
+        )
+        if info.rc != mqtt.MQTT_ERR_SUCCESS:
+            self.logger.warning(f"Failed to clear retained topic {topic}, rc={info.rc}")
+
+    def _get_forecast_topic(self) -> str:
+        """Return single retained topic for this appliance forecast."""
+        return f"{self.config.MQTT_TOPIC_PREFIX}/{self.config.MQTT_CLIENT_ID}"
+
+    def _publish_forecast_payload(self, forecast_rows: List[Dict[str, Any]]) -> None:
+        """Publish retained forecast payload to the single appliance topic."""
+        if not self._ensure_mqtt_connection():
+            return
+
+        topic = self._get_forecast_topic()
+        if not forecast_rows:
+            self._clear_retained_topic(topic)
+            self._current_forecast = []
+            self.logger.info(f"Cleared retained forecast topic {topic}")
+            return
+
+        payload = json.dumps([
+            {
+                "time": row["time"].isoformat(),
+                "load_wh": row["load_wh"],
+            }
+            for row in forecast_rows
+        ])
+
+        info = self._mqtt_client.publish(
+            topic,
+            payload=payload,
+            qos=self.config.MQTT_QOS,
+            retain=self.config.MQTT_RETAIN,
+        )
+        if info.rc == mqtt.MQTT_ERR_SUCCESS:
+            self._current_forecast = forecast_rows
+            self.logger.info(f"Published {len(forecast_rows)} forecast slots to {topic}")
+        else:
+            self.logger.warning(f"Failed to publish load forecast to {topic}, rc={info.rc}")
+
+    def _cleanup_expired_profile_topics(self) -> None:
+        """Keep retained forecast payload limited to future slots only."""
+        if not self._current_forecast:
+            return
+
+        now = datetime.now(tz.tzlocal())
+        remaining_forecast = [
+            row for row in self._current_forecast
+            if row["time"] > now
+        ]
+
+        if len(remaining_forecast) != len(self._current_forecast):
+            self._publish_forecast_payload(remaining_forecast)
+
+    def _publish_load_profile_forecast(self, program_id: int, start_time: datetime) -> None:
+        """Publish timezone-aware load forecast as one retained MQTT payload."""
+        rows = self._load_profile_rows(program_id)
+        if not rows:
+            self._publish_forecast_payload([])
+            return
+
+        now = datetime.now(tz.tzlocal())
+        if start_time.tzinfo is None:
+            start_time = start_time.replace(tzinfo=tz.tzlocal())
+        else:
+            start_time = start_time.astimezone(tz.tzlocal())
+
+        forecast_rows: List[Dict[str, Any]] = []
+
+        for row in rows:
+            slot_time = start_time + row["offset"]
+            if slot_time <= now:
+                continue
+
+            forecast_rows.append({
+                "time": slot_time,
+                "load_wh": row["energy_wh"],
+            })
+
+        self._publish_forecast_payload(forecast_rows)
+
     def _select_program(self, program_id: Optional[int] = None) -> bool:
         """Select a program without starting it"""
         if not self.device:
@@ -462,6 +660,10 @@ class DishwasherController:
         
         now = datetime.now(tz.tzlocal())
         delay_seconds = int((optimal_start - now).total_seconds())
+        program_id = self._get_selected_or_default_program_id()
+
+        # Publish forecast before triggering/scheduling start so external systems can react.
+        self._publish_load_profile_forecast(program_id, now + timedelta(seconds=max(delay_seconds, 0)))
         
         if delay_seconds <= 0:
             self.logger.info("Starting program immediately")
@@ -497,8 +699,11 @@ class DishwasherController:
         if self._is_program_finished():
             self.logger.debug("Program finished - will transition to IDLE automatically")
 
+        self._cleanup_expired_profile_topics()
+
     def _evaluate_state(self) -> None:
         """Main state evaluation logic"""
+        self._cleanup_expired_profile_topics()
         current_state = self.state
         
         if current_state == DishwasherState.IDLE:
@@ -579,6 +784,9 @@ class DishwasherController:
         """Graceful shutdown"""
         self.logger.info("Initiating graceful shutdown...")
         self._shutdown_event.set()
+
+        # Cleanup retained topics before disconnecting if possible.
+        self._cleanup_expired_profile_topics()
         
         # Close websocket connection to unblock run_forever()
         if self.device and hasattr(self.device, 'ws') and self.device.ws:
@@ -590,6 +798,15 @@ class DishwasherController:
                     self.logger.debug("Websocket closed")
             except Exception as e:
                 self.logger.debug(f"Error closing websocket: {e}")
+
+        if self._mqtt_client is not None:
+            try:
+                self._mqtt_client.loop_stop()
+                self._mqtt_client.disconnect()
+            except Exception as e:
+                self.logger.debug(f"Error closing MQTT client: {e}")
+            finally:
+                self._mqtt_client = None
         
         # Give a moment for cleanup
         sleep(0.5)
