@@ -31,7 +31,7 @@ StandardError=journal
 SyslogIdentifier=dishwasher-controller
 
 # Resource limits
-MemoryMax=25M
+MemoryMax=30M
 CPUQuota=10%
 
 [Install]
