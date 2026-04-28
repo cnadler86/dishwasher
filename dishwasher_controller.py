@@ -481,7 +481,7 @@ class DishwasherController:
                 try:
                     hours_str, minutes_str = time_raw.split(":")
                     offset = timedelta(hours=int(hours_str), minutes=int(minutes_str))
-                    energy_wh = float(energy_raw.replace(",", "."))
+                    energy_wh = int(energy_raw.replace(",", "."))
                 except Exception:
                     self.logger.warning(
                         f"Skipping invalid load profile row in {profile_path}: {row}"
