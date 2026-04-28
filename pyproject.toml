@@ -5,7 +5,6 @@ description = "Automate your BSH dishwasher to run at the best electricity price
 authors = [
     { name = "Christopher Nadler" }
 ]
-license = LICENSE
 readme = "README.md"
 requires-python = ">=3.8, !=3.12.*"
 dependencies = [

@@ -562,7 +562,7 @@ class DishwasherController:
             ]
         )
 
-        info = self._mqtt_client.publish(
+        info = self._mqtt_client.publish(  # ty:ignore[unresolved-attribute]
             topic,
             payload=payload,
             qos=self.config.MQTT_QOS,
@@ -631,7 +631,9 @@ class DishwasherController:
                 "BSH.Common.Option.StartInRelative", 0
             )
         if start_in_relative and int(start_in_relative) > 0:
-            return datetime.now(tz.tzlocal()) + timedelta(seconds=int(start_in_relative))
+            return datetime.now(tz.tzlocal()) + timedelta(
+                seconds=int(start_in_relative)
+            )
         return None
 
     def _update_forecast_from_device_state(self) -> None:
@@ -654,13 +656,17 @@ class DishwasherController:
             if program_id is None:
                 program_id = self._get_selected_or_default_program_id()
 
-            state_changed = self._last_forecast_dishwasher_state != DishwasherState.RUNNING
+            state_changed = (
+                self._last_forecast_dishwasher_state != DishwasherState.RUNNING
+            )
             program_changed = self._last_forecast_program_id != program_id
 
             if state_changed or program_changed or not self._current_forecast:
                 reason = (
-                    "state change" if state_changed
-                    else "program change" if program_changed
+                    "state change"
+                    if state_changed
+                    else "program change"
+                    if program_changed
                     else "no active forecast"
                 )
                 self.logger.info(
@@ -679,20 +685,33 @@ class DishwasherController:
                 # StartInRelative not yet reported by device - skip this cycle
                 return
 
-            state_changed = self._last_forecast_dishwasher_state != DishwasherState.SCHEDULED
+            state_changed = (
+                self._last_forecast_dishwasher_state != DishwasherState.SCHEDULED
+            )
             program_changed = self._last_forecast_program_id != program_id
             start_shifted = (
                 self._last_forecast_scheduled_start is not None
                 and abs(
-                    (scheduled_start - self._last_forecast_scheduled_start).total_seconds()
-                ) > self._RESCHEDULE_THRESHOLD_S
+                    (
+                        scheduled_start - self._last_forecast_scheduled_start
+                    ).total_seconds()
+                )
+                > self._RESCHEDULE_THRESHOLD_S
             )
 
-            if state_changed or program_changed or start_shifted or not self._current_forecast:
+            if (
+                state_changed
+                or program_changed
+                or start_shifted
+                or not self._current_forecast
+            ):
                 reason = (
-                    "state change" if state_changed
-                    else "program change" if program_changed
-                    else f"start shifted >={self._RESCHEDULE_THRESHOLD_S}s" if start_shifted
+                    "state change"
+                    if state_changed
+                    else "program change"
+                    if program_changed
+                    else f"start shifted >={self._RESCHEDULE_THRESHOLD_S}s"
+                    if start_shifted
                     else "no active forecast"
                 )
                 self.logger.info(
@@ -707,7 +726,8 @@ class DishwasherController:
         else:
             # IDLE, DISCONNECTED, ERROR → clear forecast
             was_active = self._last_forecast_dishwasher_state in (
-                DishwasherState.RUNNING, DishwasherState.SCHEDULED
+                DishwasherState.RUNNING,
+                DishwasherState.SCHEDULED,
             )
             if was_active or self._current_forecast:
                 self.logger.info(
@@ -801,7 +821,6 @@ class DishwasherController:
 
         now = datetime.now(tz.tzlocal())
         delay_seconds = int((optimal_start - now).total_seconds())
-        program_id = self._get_selected_or_default_program_id()
 
         if delay_seconds <= 0:
             self.logger.info("Starting program immediately")
@@ -830,7 +849,9 @@ class DishwasherController:
     def _handle_running_state(self) -> None:
         """Handle actions in RUNNING state"""
         if self._is_program_finished():
-            self.logger.debug("Program finished - will transition to IDLE automatically")
+            self.logger.debug(
+                "Program finished - will transition to IDLE automatically"
+            )
 
         # Keep retained payload trimmed to future slots as program progresses
         self._cleanup_expired_profile_topics()
