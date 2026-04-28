@@ -80,6 +80,9 @@ class DishwasherController:
     Main controller for automated dishwasher operation with energy optimization
     """
 
+    # Re-publish scheduled forecast when start time shifts by more than this threshold
+    _RESCHEDULE_THRESHOLD_S: int = 120
+
     def __init__(
         self,
         config_file: Optional[Path] = None,
@@ -93,7 +96,11 @@ class DishwasherController:
         self._shutdown_event = Event()
         self._last_logged_state: Optional[DishwasherState] = None
         self._awaiting_post_run_reset: bool = False
-        self._running_forecast_published: bool = False
+
+        # State-driven forecast tracking
+        self._last_forecast_dishwasher_state: Optional[DishwasherState] = None
+        self._last_forecast_program_id: Optional[int] = None
+        self._last_forecast_scheduled_start: Optional[datetime] = None
 
         # Finish times configuration
         self.finish_times = sorted(finish_times) if finish_times else None
@@ -615,6 +622,104 @@ class DishwasherController:
 
         self._publish_forecast_payload(forecast_rows)
 
+    def _derive_scheduled_start(self) -> Optional[datetime]:
+        """Compute the scheduled start time from device-reported StartInRelative."""
+        if not self.device:
+            return None
+        with self.device.state_lock:
+            start_in_relative = self.device.state.get(
+                "BSH.Common.Option.StartInRelative", 0
+            )
+        if start_in_relative and int(start_in_relative) > 0:
+            return datetime.now(tz.tzlocal()) + timedelta(seconds=int(start_in_relative))
+        return None
+
+    def _update_forecast_from_device_state(self) -> None:
+        """State-driven forecast: derive and publish purely from the actual device state.
+
+        Called once per evaluation cycle.  Handles all cases:
+        - Program running (manual or automatic start)
+        - Program scheduled (manual or automatic, time-shift detection)
+        - Program finished, cancelled, or controller idle -> clear forecast
+        """
+        current_state = self.state
+        now = datetime.now(tz.tzlocal())
+
+        if current_state == DishwasherState.RUNNING:
+            # Determine active program id
+            program_id: Optional[int] = None
+            if self.device:
+                with self.device.state_lock:
+                    program_id = self.device.state.get("BSH.Common.Root.ActiveProgram")
+            if program_id is None:
+                program_id = self._get_selected_or_default_program_id()
+
+            state_changed = self._last_forecast_dishwasher_state != DishwasherState.RUNNING
+            program_changed = self._last_forecast_program_id != program_id
+
+            if state_changed or program_changed or not self._current_forecast:
+                reason = (
+                    "state change" if state_changed
+                    else "program change" if program_changed
+                    else "no active forecast"
+                )
+                self.logger.info(
+                    f"Publishing RUNNING forecast for program {program_id} ({reason})"
+                )
+                self._publish_load_profile_forecast(program_id, now)
+                self._last_forecast_dishwasher_state = DishwasherState.RUNNING
+                self._last_forecast_program_id = program_id
+                self._last_forecast_scheduled_start = None
+
+        elif current_state == DishwasherState.SCHEDULED:
+            program_id = self._get_selected_or_default_program_id()
+            scheduled_start = self._derive_scheduled_start()
+
+            if scheduled_start is None:
+                # StartInRelative not yet reported by device - skip this cycle
+                return
+
+            state_changed = self._last_forecast_dishwasher_state != DishwasherState.SCHEDULED
+            program_changed = self._last_forecast_program_id != program_id
+            start_shifted = (
+                self._last_forecast_scheduled_start is not None
+                and abs(
+                    (scheduled_start - self._last_forecast_scheduled_start).total_seconds()
+                ) > self._RESCHEDULE_THRESHOLD_S
+            )
+
+            if state_changed or program_changed or start_shifted or not self._current_forecast:
+                reason = (
+                    "state change" if state_changed
+                    else "program change" if program_changed
+                    else f"start shifted >={self._RESCHEDULE_THRESHOLD_S}s" if start_shifted
+                    else "no active forecast"
+                )
+                self.logger.info(
+                    f"Publishing SCHEDULED forecast for program {program_id} "
+                    f"starting at {scheduled_start.isoformat()} ({reason})"
+                )
+                self._publish_load_profile_forecast(program_id, scheduled_start)
+                self._last_forecast_dishwasher_state = DishwasherState.SCHEDULED
+                self._last_forecast_program_id = program_id
+                self._last_forecast_scheduled_start = scheduled_start
+
+        else:
+            # IDLE, DISCONNECTED, ERROR → clear forecast
+            was_active = self._last_forecast_dishwasher_state in (
+                DishwasherState.RUNNING, DishwasherState.SCHEDULED
+            )
+            if was_active or self._current_forecast:
+                self.logger.info(
+                    f"Clearing forecast "
+                    f"(current={current_state.name}, "
+                    f"previous={getattr(self._last_forecast_dishwasher_state, 'name', None)})"
+                )
+                self._publish_forecast_payload([])
+            self._last_forecast_dishwasher_state = current_state
+            self._last_forecast_program_id = None
+            self._last_forecast_scheduled_start = None
+
     def _select_program(self, program_id: Optional[int] = None) -> bool:
         """Select a program without starting it"""
         if not self.device:
@@ -698,70 +803,45 @@ class DishwasherController:
         delay_seconds = int((optimal_start - now).total_seconds())
         program_id = self._get_selected_or_default_program_id()
 
-        # Publish forecast before triggering/scheduling start so external systems can react.
-        self._publish_load_profile_forecast(
-            program_id, now + timedelta(seconds=max(delay_seconds, 0))
-        )
-        self._running_forecast_published = True
-
         if delay_seconds <= 0:
             self.logger.info("Starting program immediately")
             self._start_program()
-            # State will automatically become RUNNING via device state update
+            # _update_forecast_from_device_state will publish once state becomes RUNNING
         else:
             self.logger.info(f"Scheduling program to start at {optimal_start}")
             self._start_program(start_in_seconds=delay_seconds)
-            # State will automatically become SCHEDULED via device state update
+            # _update_forecast_from_device_state will publish once state becomes SCHEDULED
 
     def _handle_scheduled_state(self) -> None:
         """Handle actions in SCHEDULED state"""
         if not self.device:
             return
 
-        # State will automatically transition to RUNNING when operation_state changes
-        # or back to IDLE if program is cancelled/finished
-        # No explicit state setting needed - it's derived from device state
-
         with self.device.state_lock:
             operation_state = self.device.state.get("BSH.Common.Status.OperationState")
             active_program = self.device.state.get("BSH.Common.Root.ActiveProgram")
 
-        # Just log for debugging
         self.logger.debug(
             f"Scheduled - OperationState: {operation_state}, ActiveProgram: {active_program}"
         )
+        # Keep retained payload trimmed to future slots while waiting for start
+        self._cleanup_expired_profile_topics()
 
     def _handle_running_state(self) -> None:
         """Handle actions in RUNNING state"""
-        # State will automatically transition to IDLE when program finishes
-        # (ActiveProgram becomes None or OperationState changes)
-        # No explicit state setting needed
-
-        # If no forecast is active (e.g. manually started program), publish one now.
-        if not self._current_forecast and not self._running_forecast_published:
-            program_id = self._get_selected_or_default_program_id()
-            if self.device:
-                with self.device.state_lock:
-                    active = self.device.state.get("BSH.Common.Root.ActiveProgram")
-                if active:
-                    program_id = active
-            self.logger.info(
-                f"Manually started program detected (id={program_id}), publishing forecast from now."
-            )
-            self._publish_load_profile_forecast(program_id, datetime.now(tz.tzlocal()))
-            self._running_forecast_published = True
-
         if self._is_program_finished():
-            self.logger.debug(
-                "Program finished - will transition to IDLE automatically"
-            )
-            self._running_forecast_published = False
+            self.logger.debug("Program finished - will transition to IDLE automatically")
 
+        # Keep retained payload trimmed to future slots as program progresses
         self._cleanup_expired_profile_topics()
 
     def _evaluate_state(self) -> None:
         """Main state evaluation logic"""
-        self._cleanup_expired_profile_topics()
+        # State-driven forecast: publish, update, or clear based on actual device state.
+        # This handles automatic starts, manual starts, manual cancellations,
+        # and schedule changes transparently.
+        self._update_forecast_from_device_state()
+
         current_state = self.state
 
         if current_state == DishwasherState.IDLE:
